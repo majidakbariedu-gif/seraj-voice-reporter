@@ -1,35 +1,15 @@
 import os
 import json
-import builtins
+import base64
 import requests
 import pandas as pd
 import jdatetime
-import arabic_reshaper
-from bidi.algorithm import get_display
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
-# ================= اصلاح نمایش فارسی در CMD =================
-def fix_fa(text):
-    if isinstance(text, str):
-        reshaped = arabic_reshaper.reshape(text)
-        return get_display(reshaped)
-    return text
-
-_orig_print = builtins.print
-def print(*args, **kwargs):
-    fixed_args = [fix_fa(str(a)) for a in args]
-    _orig_print(*fixed_args, **kwargs)
-
-_orig_input = builtins.input
-def input(prompt=""):
-    return _orig_input(fix_fa(str(prompt)))
-# ============================================================
-
-# ================= 1. این دو خط را پر کنید =================
-BALE_TOKEN = "206132192:amc4sp-7S6eXaNh3X0Frz519j6hWMX3InZA"
-GEMINI_API_KEY = "AQ.Ab8RN6IBwQneF4yZ1SrQ_zDlsv1Ud6tNXn5L8WEmiGfmqUYzqg"
-# ==========================================================
+# خواندن ایمن اطلاعات محرمانه از تنظیمات Secrets گیت‌هاب
+BALE_TOKEN = os.environ.get("BALE_TOKEN")
+GAPGPT_API_KEY = os.environ.get("GAPGPT_API_KEY")
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "0"))
 
 BALE_API_URL = f"https://tapi.bale.ai/bot{BALE_TOKEN}"
 EXCEL_FILE = "گزارش_طرح_سراج.xlsx"
@@ -37,7 +17,11 @@ ARCHIVE_DIR = "archive_voices"
 META_FILE = "voices_index.json"
 
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+ai_client = OpenAI(
+    api_key=GAPGPT_API_KEY,
+    base_url="https://api.gapgpt.app/v1"
+)
 
 def load_index():
     if os.path.exists(META_FILE):
@@ -49,15 +33,7 @@ def save_index(data):
     with open(META_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def jalali_to_timestamp(jalali_str, is_end=False):
-    if not jalali_str.strip():
-        return None
-    parts = [int(x) for x in jalali_str.strip().split("/")]
-    jdt = jdatetime.datetime(parts[0], parts[1], parts[2], 23 if is_end else 0, 59 if is_end else 0, 59 if is_end else 0)
-    return int(jdt.togregorian().timestamp())
-
 def sync_new_voices_from_bale(index_data):
-    print("در حال دریافت وویس‌های جدید از بله و ذخیره در آرشیو کامپیوتر...")
     offset = index_data["last_update_id"] + 1 if index_data["last_update_id"] > 0 else None
     params = {"timeout": 10}
     if offset:
@@ -65,12 +41,11 @@ def sync_new_voices_from_bale(index_data):
 
     res = requests.get(f"{BALE_API_URL}/getUpdates", params=params).json()
     if not res.get("ok"):
-        print("خطا در اتصال به بله! توکن را بررسی کنید:", res)
+        print("خطا در اتصال به بله:", res)
         return index_data
 
     updates = res.get("result", [])
     existing_ids = {v["msg_id"] for v in index_data["voices"]}
-    new_count = 0
 
     for item in updates:
         if item["update_id"] > index_data["last_update_id"]:
@@ -104,20 +79,19 @@ def sync_new_voices_from_bale(index_data):
                     "analyzed": False
                 })
                 existing_ids.add(msg_id)
-                new_count += 1
 
     save_index(index_data)
-    if new_count > 0:
-        print(f" -> {new_count} وویس جدید از بله دانلود و در آرشیو ذخیره شد.")
     return index_data
 
 def analyze_voice(audio_path, msg_jalali_date):
-    uploaded_file = ai_client.files.upload(file=audio_path)
+    with open(audio_path, "rb") as audio_file:
+        encoded_audio = base64.b64encode(audio_file.read()).decode("utf-8")
+
     prompt = f"""
     این یک پیام صوتی گزارش عملکرد از کادر آموزشی/تربیتی طرح سراج است که در تاریخ {msg_jalali_date} ارسال شده است.
     لطفاً به فایل صوتی دقیق گوش بده و اطلاعات زیر را استخراج کن. اگر موردی در وویس ذکر نشده بود، عبارت "ذکر نشده" را بنویس (اگر تاریخ گفته نشد از {msg_jalali_date} استفاده کن).
 
-    خروجی باید دقیقاً یک آبجکت JSON با کلیدهای زیر باشد:
+    خروجی باید دقیقاً و صرفاً یک آبجکت JSON معتبر (بدون هیچ متن اضافی یا علامت مارک‌داون) با کلیدهای زیر باشد:
     - "نام_گزارش_دهنده"
     - "روز"
     - "تاریخ"
@@ -132,66 +106,68 @@ def analyze_voice(audio_path, msg_jalali_date):
     - "اولویت_پیگیری"
     - "توضیحات_بیشتر"
     """
-    response = ai_client.models.generate_content(
+
+    response = ai_client.chat.completions.create(
         model="gemini-2.5-flash",
-        contents=[uploaded_file, prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+        temperature=0.1,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": encoded_audio, "format": "ogg"}
+                    }
+                ]
+            }
+        ]
     )
-    ai_client.files.delete(name=uploaded_file.name)
-    return json.loads(response.text)
+
+    raw_text = response.choices[0].message.content.strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`").replace("json", "", 1).strip()
+    return json.loads(raw_text)
+
+def send_excel_to_bale(file_path, caption_text):
+    with open(file_path, "rb") as doc:
+        res = requests.post(
+            f"{BALE_API_URL}/sendDocument",
+            data={"chat_id": MY_CHAT_ID, "caption": caption_text},
+            files={"document": doc}
+        ).json()
+        print("وضعیت ارسال اکسل به بله:", res.get("ok"))
 
 def main():
-    print("=== سیستم گزارش‌گیری هوشمند طرح سراج ===")
-    
+    today_jalali = jdatetime.datetime.now().strftime("%Y/%m/%d")
+    print(f"=== شروع گزارش‌گیری خودکار شبانه ({today_jalali}) ===")
+
     index_data = load_index()
     index_data = sync_new_voices_from_bale(index_data)
 
-    print("\nحالا بازه تاریخی گزارش‌گیری را مشخص کنید (برای دریافت همه موارد تحلیل‌نشده، فقط Enter بزنید):")
-    start_str = input("از چه تاریخی؟ (مثلاً 1405/08/25): ")
-    end_str = input("تا چه تاریخی؟ (مثلاً 1405/09/03): ")
-
-    has_date_filter = bool(start_str.strip() or end_str.strip())
-    start_ts = jalali_to_timestamp(start_str, is_end=False)
-    end_ts = jalali_to_timestamp(end_str, is_end=True)
-
     extracted_rows = []
-
     for v in index_data["voices"]:
-        if not os.path.exists(v["file_path"]):
+        if v.get("analyzed") or not os.path.exists(v["file_path"]):
             continue
 
-        if not has_date_filter and v.get("analyzed"):
-            continue
-
-        if start_ts and v["timestamp"] < start_ts:
-            continue
-        if end_ts and v["timestamp"] > end_ts:
-            continue
-
-        print(f"در حال تحلیل وویس تاریخ {v['jalali_date']} (شناسه {v['msg_id']})...")
         try:
             data = analyze_voice(v["file_path"], v["jalali_date"])
             extracted_rows.append(data)
             v["analyzed"] = True
-            print(f" -> انجام شد: {data.get('نام_گزارش_دهنده')} | اولویت: {data.get('اولویت_پیگیری')}")
         except Exception as e:
-            print(f" -> خطا در تحلیل هوش مصنوعی: {e}")
+            print(f"خطا در تحلیل وویس {v['msg_id']}: {e}")
 
     save_index(index_data)
 
     if extracted_rows:
         df_new = pd.DataFrame(extracted_rows)
-        if os.path.exists(EXCEL_FILE):
-            df_old = pd.read_excel(EXCEL_FILE)
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
-        else:
-            df_final = df_new
-        df_final.to_excel(EXCEL_FILE, index=False)
-        print(f"\n✅ عالی! {len(extracted_rows)} گزارش با موفقیت استخراج و در فایل اکسل ثبت شد.")
-    else:
-        print("\nهیچ وویسی مطابق با بازه زمانی انتخابی شما یافت نشد.")
+        df_new.to_excel(EXCEL_FILE, index=False)
 
-    input("\nبرای خروج کلید Enter را بزنید...")
+        caption = f"📊 گزارش روزانه طرح سراج ({today_jalali})\nتعداد گزارش‌های پردازش‌شده: {len(extracted_rows)} مورد"
+        send_excel_to_bale(EXCEL_FILE, caption)
+        print("فایل اکسل با موفقیت ساخته و در بله ارسال شد.")
+    else:
+        print("امشب هیچ وویس جدیدی برای تحلیل ثبت نشده بود.")
 
 if __name__ == "__main__":
     main()
