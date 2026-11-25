@@ -1,7 +1,7 @@
 name: Daily Seraj Report
 on:
   schedule:
-    - cron: '30 18 * * *'
+    - cron: '30 19 * * *'  # معادل ساعت ۲۳:۰۰ (۱۱ شب) به وقت تهران
   workflow_dispatch:
 
 permissions:
